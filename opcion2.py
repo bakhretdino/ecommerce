@@ -9,6 +9,11 @@ from mlxtend.frequent_patterns import apriori
 from mlxtend.frequent_patterns import association_rules
 from collections import defaultdict
 from multiprocessing import Pool
+import kagglehub
+from multiprocessing.pool import ThreadPool
+
+# Download dataset
+dataset_path = kagglehub.dataset_download("mkechinov/ecommerce-behavior-data-from-multi-category-store")
 
 def procesar_chunk_mapreduce(chunk):
     """
@@ -67,6 +72,8 @@ def aplicar_kmeans(df):
     """
     Aplica K-means para segmentar usuarios
     """
+    df = df.fillna(0)
+
     # Preparar características para clustering
     features = pd.DataFrame({
         'total_gasto': df[df['event_type'] == 'purchase'].groupby('user_id')['price'].sum(),
@@ -91,12 +98,16 @@ def aplicar_apriori(df, min_support=0.01):
     """
     Aplica algoritmo Apriori para encontrar patrones de compra frecuentes
     """
+    df = df.fillna(0)
     # Crear matriz de transacciones
     transacciones = df[df['event_type'] == 'purchase'].groupby('user_session')['product_id'].agg(list)
     
     # Convertir a formato one-hot
     transacciones_matrix = pd.get_dummies(pd.DataFrame(transacciones.tolist()))
     
+    # Convert to binary (boolean) values for Apriori
+    transacciones_matrix = transacciones_matrix.astype(bool)
+
     # Aplicar Apriori
     frequent_itemsets = apriori(transacciones_matrix, min_support=min_support, use_colnames=True)
     
@@ -109,20 +120,21 @@ def analizar_ecommerce(carpeta_datos):
     """
     Función principal de análisis
     """
-    # Obtener lista de archivos CSV comprimidos
-    archivos_csv = glob(os.path.join(carpeta_datos, '*.csv.gz'))
-    if not archivos_csv:
-        raise ValueError(f"No se encontraron archivos CSV.GZ en {carpeta_datos}")
+    # Obtener lista de files CSV extraídos
+    # files_csv = glob(os.path.join(carpeta_datos, '*.csv'))
+    files_csv = [carpeta_datos]
+    if not files_csv:
+        raise ValueError(f"No se encontraron files CSV en {carpeta_datos}")
     
     resultados_totales = []
     datos_completos = pd.DataFrame()
     
-    for archivo in archivos_csv:
-        print(f"Procesando archivo: {archivo}")
+    for file in files_csv:
+        print(f"Procesando file: {file}")
         
-        # Leer archivo comprimido en chunks
-        chunks = pd.read_csv(archivo, compression='gzip', chunksize=100000)
-        
+        # Leer file en chunks
+        chunks = pd.read_csv(file, chunksize=100000)
+
         # Aplicar MapReduce
         with Pool() as pool:
             resultados_chunks = pool.map(procesar_chunk_mapreduce, chunks)
@@ -132,7 +144,7 @@ def analizar_ecommerce(carpeta_datos):
         resultados_totales.append(resultados)
         
         # Guardar datos para análisis posteriores
-        for chunk in pd.read_csv(archivo, compression='gzip', chunksize=100000):
+        for chunk in pd.read_csv(file, chunksize=100000):
             datos_relevantes = chunk[['event_time', 'event_type', 'product_id', 
                                     'user_id', 'user_session', 'price']].copy()
             datos_completos = pd.concat([datos_completos, datos_relevantes])
@@ -154,12 +166,46 @@ def analizar_ecommerce(carpeta_datos):
         'apriori': reglas_asociacion
     }
 
+def extract_chunks(input_csv, output_csv, num_chunks, chunk_size=100000):
+    """
+    Extracts N chunks of a given chunk size from a CSV file and saves them to another CSV file.
+    
+    Parameters:
+    - input_csv (str): Path to the input CSV file.
+    - output_csv (str): Path to the output CSV file.
+    - num_chunks (int): Number of chunks to extract.
+    - chunk_size (int): Number of rows per chunk (default 100000).
+    """
+    chunk_list = []  # Store chunks to concatenate later
+    chunk_counter = 0
+
+    # Read the CSV in chunks
+    for chunk in pd.read_csv(input_csv, chunksize=chunk_size):
+        chunk_list.append(chunk)
+        chunk_counter += 1
+        
+        # Stop if we have extracted the required number of chunks
+        if chunk_counter >= num_chunks:
+            break
+
+    # Combine extracted chunks
+    if chunk_list:
+        extracted_data = pd.concat(chunk_list)
+        extracted_data.to_csv(output_csv, index=False)
+        print(f"Extracted {num_chunks} chunks ({chunk_size * num_chunks} rows) and saved to {output_csv}")
+    else:
+        print("No data was extracted. Check the input file or chunk size.")
 
 # Ejemplo de uso
 if __name__ == "__main__":
-    carpeta_datos = r"C:\Users\alela\Documents\UNED\datos" 
+    carpeta_datos = dataset_path
+    output_file = "extracted_data.csv"
+    num_chunks_to_extract = 5
+    csv_files = glob(os.path.join(carpeta_datos, "*.csv"))
+    extract_chunks(csv_files[0], output_file, num_chunks_to_extract)
+    
     try:
-        resultados = analizar_ecommerce(carpeta_datos)
+        resultados = analizar_ecommerce(output_file)
         
         # Imprimir resultados
         print("\n=== Resultados MapReduce ===")
