@@ -23,3 +23,8 @@ if exist requirements.txt (
 ) else (
     echo requirements.txt not found! Skipping dependency installation.
 )
+
+REM Inform the user to activate the virtual environment
+echo To activate the virtual environment, run:
+echo call %VENV_DIR%\Scripts\activate.bat
+pause

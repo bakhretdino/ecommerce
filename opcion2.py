@@ -3,14 +3,18 @@ import numpy as np
 from datetime import datetime
 from glob import glob
 import os
+import argparse
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
-from mlxtend.frequent_patterns import apriori
-from mlxtend.frequent_patterns import association_rules
+from mlxtend.frequent_patterns import apriori, association_rules
 from collections import defaultdict
 from multiprocessing import Pool
 import kagglehub
-from multiprocessing.pool import ThreadPool
+from sklearn.preprocessing import MultiLabelBinarizer
+
+# os.environ['KAGGLE_CONFIG_DIR'] = os.getcwd()
+# local_dataset_path = os.path.join(os.getcwd(), 'ecommerce_dataset')
+# os.makedirs(local_dataset_path, exist_ok=True)
 
 # Download dataset
 dataset_path = kagglehub.dataset_download("mkechinov/ecommerce-behavior-data-from-multi-category-store")
@@ -26,29 +30,35 @@ def procesar_chunk_mapreduce(chunk):
         'productos_juntos': defaultdict(int)
     }
     
+    # Optimizar tipos de datos
+    # chunk['user_id'] = chunk['user_id'].astype('uint32')
+    # chunk['product_id'] = chunk['product_id'].astype('uint32')
+    # chunk['price'] = chunk['price'].astype('float32')
+
     # Procesar cada sesión en el chunk
     for session_id, session_data in chunk.groupby('user_session'):
         # Contar interacciones
         user_id = session_data['user_id'].iloc[0]
         resultados['interacciones'][user_id] += len(session_data)
-        
-        # Procesar compras
+
+        # Compras
         compras = session_data[session_data['event_type'] == 'purchase']
         if not compras.empty:
             resultados['compras'][user_id] += compras['price'].sum()
-            
-        # Procesar vistas
+
+        # Productos vistos
         productos_vistos = session_data[session_data['event_type'] == 'view']['product_id'].unique()
         resultados['vistas'][user_id] += len(productos_vistos)
-        
-        # Registrar productos vistos juntos
+
+        # Productos vistos juntos
         if len(productos_vistos) > 1:
             for i in range(len(productos_vistos)):
                 for j in range(i + 1, len(productos_vistos)):
                     pair = tuple(sorted([productos_vistos[i], productos_vistos[j]]))
                     resultados['productos_juntos'][pair] += 1
-    
+
     return resultados
+
 
 def reduce_resultados(resultados_list):
     """
@@ -65,8 +75,9 @@ def reduce_resultados(resultados_list):
         for key in resultados:
             for id_, valor in resultados[key].items():
                 resultados_combinados[key][id_] += valor
-    
+
     return resultados_combinados
+
 
 def aplicar_kmeans(df):
     """
@@ -83,16 +94,14 @@ def aplicar_kmeans(df):
     
     # Normalizar datos
     scaler = StandardScaler()
-    features_scaled = scaler.fit_transform(features)
-    
+    features_scaled = scaler.fit_transform(features[['total_gasto', 'frecuencia_compra', 'productos_vistos']])
+
     # Aplicar K-means
-    kmeans = KMeans(n_clusters=4, random_state=42)
-    clusters = kmeans.fit_predict(features_scaled)
-    
-    # Añadir resultados al DataFrame
-    features['cluster'] = clusters
-    
+    kmeans = KMeans(n_clusters=4, random_state=42, n_init=10)
+    features['cluster'] = kmeans.fit_predict(features_scaled)
+
     return features
+
 
 def aplicar_apriori(df, min_support=0.01):
     """
@@ -110,85 +119,70 @@ def aplicar_apriori(df, min_support=0.01):
 
     # Aplicar Apriori
     frequent_itemsets = apriori(transacciones_matrix, min_support=min_support, use_colnames=True)
-    
+
     # Generar reglas de asociación
     rules = association_rules(frequent_itemsets, metric="confidence", min_threshold=0.5)
-    
+
     return rules
+
 
 def analizar_ecommerce(carpeta_datos):
     """
     Función principal de análisis
     """
     # Obtener lista de files CSV extraídos
-    # files_csv = glob(os.path.join(carpeta_datos, '*.csv'))
-    files_csv = [carpeta_datos]
+    files_csv = glob(os.path.join(carpeta_datos, '*.csv'))
     if not files_csv:
         raise ValueError(f"No se encontraron files CSV en {carpeta_datos}")
-    
+
     resultados_totales = []
-    datos_completos = pd.DataFrame()
-    
+
     for file in files_csv:
         print(f"Procesando file: {file}")
-        
-        # Leer file en chunks
-        chunks = pd.read_csv(file, chunksize=100000)
+
+        # Leer file en chunks con Pandas
+        chunk_size = 100000  # Puedes ajustar este valor
+        chunks = pd.read_csv(file, usecols=['event_time', 'event_type', 'product_id', 'user_id', 'user_session', 'price'], chunksize=chunk_size)
 
         # Aplicar MapReduce
         with Pool() as pool:
             resultados_chunks = pool.map(procesar_chunk_mapreduce, chunks)
-        
-        # Combinar resultados
+
+        # Reducir resultados
         resultados = reduce_resultados(resultados_chunks)
         resultados_totales.append(resultados)
-        
-        # Guardar datos para análisis posteriores
-        for chunk in pd.read_csv(file, chunksize=100000):
-            datos_relevantes = chunk[['event_time', 'event_type', 'product_id', 
-                                    'user_id', 'user_session', 'price']].copy()
-            datos_completos = pd.concat([datos_completos, datos_relevantes])
-    
-    # Combinar todos los resultados
+
+    # Reducir resultados finales
     resultados_finales = reduce_resultados(resultados_totales)
-    
-    # Aplicar K-means
+
+    # Aplicar K-means y Apriori
     print("Aplicando K-means...")
-    segmentos_usuarios = aplicar_kmeans(datos_completos)
-    
-    # Aplicar Apriori
+    df = pd.read_csv(file, usecols=['event_time', 'event_type', 'product_id', 'user_id', 'user_session', 'price'])
+    segmentos_usuarios = aplicar_kmeans(df)
+
     print("Aplicando Apriori...")
-    reglas_asociacion = aplicar_apriori(datos_completos)
-    
+    reglas_asociacion = aplicar_apriori(df)
+
     return {
         'mapreduce': resultados_finales,
         'kmeans': segmentos_usuarios,
         'apriori': reglas_asociacion
     }
 
+
 def extract_chunks(input_csv, output_csv, num_chunks, chunk_size=100000):
     """
-    Extracts N chunks of a given chunk size from a CSV file and saves them to another CSV file.
-    
-    Parameters:
-    - input_csv (str): Path to the input CSV file.
-    - output_csv (str): Path to the output CSV file.
-    - num_chunks (int): Number of chunks to extract.
-    - chunk_size (int): Number of rows per chunk (default 100000).
+    Extrae N chunks de un archivo CSV grande y los guarda en otro CSV.
     """
-    chunk_list = []  # Store chunks to concatenate later
+    chunk_list = []
     chunk_counter = 0
 
-    # Read the CSV in chunks
     for chunk in pd.read_csv(input_csv, chunksize=chunk_size):
         chunk_list.append(chunk)
         chunk_counter += 1
-        
-        # Stop if we have extracted the required number of chunks
         if chunk_counter >= num_chunks:
             break
 
-    # Combine extracted chunks
     if chunk_list:
         extracted_data = pd.concat(chunk_list)
         extracted_data.to_csv(output_csv, index=False)
@@ -196,29 +190,33 @@ def extract_chunks(input_csv, output_csv, num_chunks, chunk_size=100000):
     else:
         print("No data was extracted. Check the input file or chunk size.")
 
-# Ejemplo de uso
+
 if __name__ == "__main__":
-    carpeta_datos = dataset_path
-    output_file = "extracted_data.csv"
-    num_chunks_to_extract = 5
-    csv_files = glob(os.path.join(carpeta_datos, "*.csv"))
-    extract_chunks(csv_files[0], output_file, num_chunks_to_extract)
-    
+    parser = argparse.ArgumentParser(description="Análisis de ecommerce")
+    parser.add_argument('--test', '-t', action='store_true', help="Ejecutar en modo de prueba con un extracto pequeño de datos")
+
+    args = parser.parse_args()
+
+    # Si se ejecuta en modo test, usar 'extracted_data.csv'
+    if args.test:
+        carpeta_datos = "."
+    else:
+        carpeta_datos = dataset_path
+
     try:
-        resultados = analizar_ecommerce(output_file)
-        
-        # Imprimir resultados
+        resultados = analizar_ecommerce(carpeta_datos)
+
         print("\n=== Resultados MapReduce ===")
         print(f"Total usuarios únicos: {len(resultados['mapreduce']['interacciones'])}")
         print(f"Total pares de productos vistos juntos: {len(resultados['mapreduce']['productos_juntos'])}")
-        
+
         print("\n=== Resultados K-means ===")
         print("Distribución de clusters:")
         print(resultados['kmeans']['cluster'].value_counts())
-        
+
         print("\n=== Resultados Apriori ===")
         print("Top 5 reglas de asociación por confianza:")
         print(resultados['apriori'].sort_values('confidence', ascending=False).head())
-        
+
     except Exception as e:
         print(f"Error durante el análisis: {str(e)}")
